@@ -1,0 +1,128 @@
+name: ci-flow-backend
+
+on:
+  push:
+    branches:
+      - "production"
+  workflow_dispatch:
+
+env:
+  DOCKER_REPO_NAME: xxxxx
+  JWT_SECRET: ci
+  SERVER_USER: ubuntu
+  SERVER_DIR: /home/ubuntu/
+  BUCKET_NAME: xxxx x  CLOUDFRONT_DISTRIBUTION: xxxxx
+  AWS_DEFAULT_REGION: xxxx
+
+jobs:
+  test-and-build-server:
+    runs-on: ubuntu-latest
+    container: node:lts-alpine
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install npm deps
+        working-directory: backend
+        run: |
+          yarn
+      - name: Build project
+        working-directory: backend
+        run: |
+          yarn build
+      - name: archive built files
+        uses: actions/upload-artifact@v3
+        with:
+          name: dist
+          path: backend/dist
+
+  deploy-server-to-docker:
+    needs: test-and-build-server
+    runs-on: ubuntu-latest
+    container: docker:20.10.21-alpine3.16
+    steps:
+      - uses: actions/checkout@v3
+      - name: restore built files server
+        uses: actions/download-artifact@v3
+        with:
+          name: dist
+          path: backend/dist
+      - name: Build docker image for server
+        working-directory: backend
+        run: |
+          docker build -t leochanyk/trip-planner-backend-server:latest .
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Do Docker tag and push
+        working-directory: backend
+        run: |
+          docker push ${{ env.DOCKER_REPO_NAME }}
+
+  ssh-ec2-and-compose-up:
+    needs: deploy-server-to-docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Executing remote ssh
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          username: ${{ env.SERVER_USER }}
+          script: |
+            cd ${{ env.SERVER_DIR }}
+            sudo usermod -aG docker ${{ env.SERVER_USER }}
+            sudo service docker restart
+            docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
+            sudo docker-compose pull
+            sudo docker-compose up -d && sudo docker ps
+
+  test-and-build-react:
+    runs-on: ubuntu-latest
+    container: node:lts-alpine
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install yarn deps
+        working-directory: frontend
+        run: yarn install
+      - name: Build frondend project
+        working-directory: frontend
+        env:
+          VITE_SERVER_API: https://tripplanner.backend.apexchampion.me
+        run: yarn run build
+      - name: Archive react built files
+        uses: actions/upload-artifact@v3
+        with:
+          name: dist
+          path: frontend/dist
+
+  deploy-react-to-aws:
+    needs:
+      - test-and-build-react
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Restore frontend files
+        uses: actions/download-artifact@v3
+        with:
+          name: dist
+          path: frontend/dist
+      - name: Check built files in server
+        working-directory: frontend
+        run: |
+          ls dist/index.html
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+          cache: "pip"
+      - name: Install aws cli
+        run: pip install -r requirements.txt
+      - name: Deploy to s3 and cloudfront
+        working-directory: frontend
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+        run: |
+          aws s3 sync ./dist s3://${{env.BUCKET_NAME}} --delete
+          aws cloudfront create-invalidation --distribution-id ${{env.CLOUDFRONT_DISTRIBUTION}} --paths "/*"
